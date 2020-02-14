@@ -17,18 +17,17 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 // Copyright (c) 2018 andreymal
 // All rights reserved
 
-// LIVE555 Proxy Server Ex
-// main program
-
 #include <sstream>
+//#include <iostream>
+#include <map>
 #include <string>
+#include <unistd.h>
 #include <vector>
 #include <algorithm>
 #include <sys/stat.h>
 #include "liveMedia.hh"
 #include "BasicUsageEnvironment.hh"
 #include "inih/INIReader.hh"
-
 struct ProxyStream {
   std::string proxiedURL;
   std::string streamName;
@@ -46,6 +45,14 @@ std::vector<ProxyStream> streams;
 std::vector<std::string> streamNames; // for collision detection
 
 // Global configuration
+std::map< std::string, std::string> rtsp_streams;
+std::map< std::string, std::string> dummy_rtsp_streams;
+std::map<std::string,ServerMediaSession *> stream_map;
+RTSPServer* rtspServer;
+std::vector<ProxyStream>::iterator it;
+
+char *inifile;
+bool flag = false;
 int verbosityLevel = 0;
 Boolean streamRTPOverTCP = False;
 Boolean tryStandardPortNumbers = True;
@@ -181,7 +188,6 @@ bool loadINIFile(const char* inifile) {
   singleStreamNameTemplate = reader.Get("general", "single_stream_name", singleStreamNameTemplate);
   // TODO: %d should be validated here
   multipleStreamNameTemplate = reader.Get("general", "multiple_stream_name", multipleStreamNameTemplate);
-
   int outPacketMaxSizeTmp = reader.GetInteger("general", "out_packet_max_size", 0);
   if (outPacketMaxSizeTmp < 0) {
     *env << "Invalid out_packet_max_size\n";
@@ -207,10 +213,10 @@ bool loadINIFile(const char* inifile) {
 
   while (std::getline(ss1, url, '\n') && std::getline(ss2, streamName, '\n')) {
     // Ensure that there are no collision with previous streams
-    if (std::find(streamNames.begin(), streamNames.end(), streamName) != streamNames.end()) {
-      *env << "Conflict: stream name " << streamName.c_str() << " is already used\n";
-      return false;
-    }
+//    if (std::find(streamNames.begin(), streamNames.end(), streamName) != streamNames.end()) {
+//      *env << "Conflict: stream name " << streamName.c_str() << " is already used\n";
+//      return false;
+//    }
 
     ProxyStream stream;
     stream.proxiedURL = url;
@@ -361,19 +367,12 @@ bool parseURLs(int argc, char** argv, int urlsStartPos) {
 
   while (urlsStartPos < argc) {
     char streamName[127];
-
-    if (i == 1 && urlsStartPos == argc - 1) {
-      sprintf(streamName, "%s", singleStreamNameTemplate.c_str()); // there's just one stream; give it this name
-    } else {
-      sprintf(streamName, multipleStreamNameTemplate.c_str(), i); // there's more than one stream; distinguish them by name
-    }
-
     std::string cppStreamName(streamName);
 
     // Ensure that there are no collisions with streams from config files
     if (std::find(streamNames.begin(), streamNames.end(), cppStreamName) != streamNames.end()) {
       *env << "Conflict: stream name " << streamName << " is already used\n";
-      return false;
+      continue;
     }
 
     ProxyStream stream;
@@ -391,25 +390,83 @@ bool parseURLs(int argc, char** argv, int urlsStartPos) {
 
   return true;
 }
+void dummyTask(void) {
 
+    for(it = streams.begin(); it != streams.end(); ++it) {
+    for (auto itr = rtsp_streams.find((*it).streamName.c_str()); itr != rtsp_streams.end(); itr++)
+    {
+        if (rtsp_streams[((*it).streamName.c_str())] == (*it).proxiedURL.c_str())  //rtsp_url exists
+        {
+            dummy_rtsp_streams.erase((*it).streamName.c_str());
+            flag=true;
+            break;
+        }
+        else
+        {                                                                       //update
+            dummy_rtsp_streams.erase((*it).streamName.c_str());
+            rtsp_streams[((*it).streamName.c_str())] = (*it).proxiedURL.c_str();
+            rtspServer->deleteServerMediaSession(stream_map[(*it).streamName.c_str()]);
+            *env<< "Updated RTSP Stream url \n";
+            break;
+        }
+    }
+    if (flag==true)                     // RTSP URL already exist
+    {
+        flag=false;
+        continue;
+    }
+
+    // Adding ProxyServer Media Session
+    rtsp_streams[(*it).streamName.c_str()]=(*it).proxiedURL.c_str();
+    ServerMediaSession* sms
+      = ProxyServerMediaSession::createNew(*env, rtspServer,
+          (*it).proxiedURL.c_str(),
+          (*it).streamName.c_str(),
+          (*it).username.length() > 0 ? (*it).username.c_str() : NULL,
+          (*it).password.length() > 0 ? (*it).password.c_str() : NULL,
+          (*it).tunnelOverHTTPPortNum, verbosityLevel);
+    stream_map[(*it).streamName.c_str()]=sms;
+    rtspServer->addServerMediaSession(sms);
+
+    char* proxyStreamURL = rtspServer->rtspURL(sms);
+    *env << "RTSP stream, proxying the stream \"" << (*it).proxiedURL.c_str() << "\"\n";
+    *env << "\tPlay this stream using the URL: " << proxyStreamURL << "\n";
+    delete[] proxyStreamURL;
+  if (proxyREGISTERRequests) {
+    *env << "(We handle incoming \"REGISTER\" requests on port " << rtspServerPortNum << ")\n";
+  }
+  }
+
+  for (auto itr = dummy_rtsp_streams.begin(); itr != dummy_rtsp_streams.end(); itr++)
+  {
+      rtspServer->deleteServerMediaSession(stream_map[(itr)->first]);
+      dummy_rtsp_streams.erase((itr)->first);
+      *env<<"Deleted RTSP Stream \n";
+      rtsp_streams.erase((itr)->first);
+  }
+  dummy_rtsp_streams = rtsp_streams;
+  streams.clear();
+  includeConfig(inifile);
+   // Call this again, after a brief delay:
+   int uSecsToDelay = 1000000; // 1 s
+   env->taskScheduler().scheduleDelayedTask(uSecsToDelay,
+                                            (TaskFunc*)dummyTask, NULL);
+}
 
 int main(int argc, char** argv) {
 
   // Begin by setting up our usage environment:
   TaskScheduler* scheduler = BasicTaskScheduler::createNew();
   env = BasicUsageEnvironment::createNew(*scheduler);
-
   *env << "LIVE555 Proxy Server Ex\n"
        << "\t(LIVE555 Streaming Media library version "
        << LIVEMEDIA_LIBRARY_VERSION_STRING
        << "; licensed under the GNU LGPL)\n\n";
-
   // Check command-line arguments: optional parameters, then one or more rtsp:// URLs (of streams to be proxied):
   progName = argv[0];
   if (argc < 2) usage();
-
   // Config file has low priority, so it should be loaded first
-  char *inifile = findConfigPath(argc, argv);
+  inifile = findConfigPath(argc, argv);
   if (inifile != NULL) {
     if (!includeConfig(inifile)) {
       *env << "Cannot parse config files\n";
@@ -423,7 +480,7 @@ int main(int argc, char** argv) {
     usage();
   }
 
-  // Parse URLs from command line arguments
+//   Parse URLs from command line arguments
   if (!parseURLs(argc, argv, urlsStartPos)) {
     return 1;
   }
@@ -431,8 +488,6 @@ int main(int argc, char** argv) {
   if (streams.size() < 1 && !proxyREGISTERRequests) {
     usage();
   }
-
-  std::vector<ProxyStream>::iterator it;
 
   // Make sure that the remaining arguments appear to be "rtsp://" URLs:
   for(it = streams.begin(); it != streams.end(); ++it) {
@@ -464,7 +519,7 @@ int main(int argc, char** argv) {
   // Create the RTSP server. Try first with the configured port number,
   // and then with the default port number (554) if different,
   // and then with the alternative port number (8554):
-  RTSPServer* rtspServer;
+
   rtspServer = createRTSPServer(rtspServerPortNum);
   if (rtspServer == NULL && tryStandardPortNumbers && rtspServerPortNum != 554) {
     *env << "Unable to create a RTSP server with port number " << rtspServerPortNum << ": " << env->getResultMsg() << "\n";
@@ -481,34 +536,13 @@ int main(int argc, char** argv) {
     *env << "Failed to create RTSP server: " << env->getResultMsg() << "\n";
     exit(1);
   }
-
-  // Create a proxy for each "rtsp://" URL specified on the command line:
-  for(it = streams.begin(); it != streams.end(); ++it) {
-    ServerMediaSession* sms
-      = ProxyServerMediaSession::createNew(*env, rtspServer,
-          (*it).proxiedURL.c_str(),
-          (*it).streamName.c_str(),
-          (*it).username.length() > 0 ? (*it).username.c_str() : NULL,
-          (*it).password.length() > 0 ? (*it).password.c_str() : NULL,
-          (*it).tunnelOverHTTPPortNum, verbosityLevel);
-    rtspServer->addServerMediaSession(sms);
-
-    char* proxyStreamURL = rtspServer->rtspURL(sms);
-    *env << "RTSP stream, proxying the stream \"" << (*it).proxiedURL.c_str() << "\"\n";
-    *env << "\tPlay this stream using the URL: " << proxyStreamURL << "\n";
-    delete[] proxyStreamURL;
-  }
-
-  if (proxyREGISTERRequests) {
-    *env << "(We handle incoming \"REGISTER\" requests on port " << rtspServerPortNum << ")\n";
-  }
-
+   dummyTask();   // ScheduleDelayedTask
   // Also, attempt to create a HTTP server for RTSP-over-HTTP tunneling.
   // Try first with the default HTTP port (80), and then with the alternative HTTP
   // port numbers (8000 and 8080).
   if (serverTunnelingOverHTTP) {
     Boolean success;
-
+//    *env<<serverTunnelingOverHTTPPortNum<<"88888 \n";
     if (serverTunnelingOverHTTPPortNum == 0) {
       success = (rtspServer->setUpTunnelingOverHTTP(80) || rtspServer->setUpTunnelingOverHTTP(8000) || rtspServer->setUpTunnelingOverHTTP(8080));
     } else {
@@ -523,9 +557,7 @@ int main(int argc, char** argv) {
   } else {
     *env << "\n(RTSP-over-HTTP tunneling is disabled.)\n";
   }
-
-  // Now, enter the event loop:
-  env->taskScheduler().doEventLoop(); // does not return
+   env->taskScheduler().doEventLoop(); // does not return
 
   return 0; // only to prevent compiler warning
 }
