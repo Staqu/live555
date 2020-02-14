@@ -29,3 +29,13 @@ The remote endpoint is using a buggy implementation of RTP/RTCP-over-TCP.  Pleas
 ### Add -d option
 See Proxyserver_check_interPacketGap_2017.01.26.patch - This allows specifying a number of seconds of inactivity
 before timing out the connection.
+
+### Schedule Delayed Task Event
+sheduledelayedtask event created: Every 1 sec checks for the update in the .cfg file. Incase of change like Add, Update, Delete of RTSP urls, RTSP proxy server changes.
+#### Add
+A new servermediasession (sms) is created in case of a new RTSP url is added to the file.
+#### Delete
+Existing servermediasession (sms) is deleted using deleteservermediasession() method.
+#### Update
+Update existing rtsp url corresponding to existing rtsp url name. Deleted the previous servermediasession object and created a new object with the updated rtsp url.
+
