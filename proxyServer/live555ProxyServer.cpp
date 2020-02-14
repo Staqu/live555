@@ -13,33 +13,76 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2019, Live Networks, Inc.  All rights reserved
-// LIVE555 Proxy Server
-// main program
+// Copyright (c) 1996-2018, Live Networks, Inc.
+// Copyright (c) 2018 andreymal
+// All rights reserved
 
+#include <sstream>
+//#include <iostream>
+#include <map>
+#include <string>
+#include <unistd.h>
+#include <vector>
+#include <algorithm>
+#include <sys/stat.h>
 #include "liveMedia.hh"
 #include "BasicUsageEnvironment.hh"
+#include "inih/INIReader.hh"
+struct ProxyStream {
+  std::string proxiedURL;
+  std::string streamName;
+  std::string username;
+  std::string password;
+  portNumBits tunnelOverHTTPPortNum;
+};
 
 char const* progName;
 UsageEnvironment* env;
 UserAuthenticationDatabase* authDB = NULL;
 UserAuthenticationDatabase* authDBForREGISTER = NULL;
 
-// Default values of command-line parameters:
+std::vector<ProxyStream> streams;
+std::vector<std::string> streamNames; // for collision detection
+
+// Global configuration
+std::map< std::string, std::string> rtsp_streams;
+std::map< std::string, std::string> dummy_rtsp_streams;
+std::map<std::string,ServerMediaSession *> stream_map;
+RTSPServer* rtspServer;
+std::vector<ProxyStream>::iterator it;
+
+char *inifile;
+bool flag = false;
 int verbosityLevel = 0;
 Boolean streamRTPOverTCP = False;
-portNumBits tunnelOverHTTPPortNum = 0;
+Boolean tryStandardPortNumbers = True;
+Boolean serverTunnelingOverHTTP = True;
+portNumBits serverTunnelingOverHTTPPortNum = 0; // It tries 80, 8000 or 8080 by default
 portNumBits rtspServerPortNum = 554;
-char* username = NULL;
-char* password = NULL;
 Boolean proxyREGISTERRequests = False;
-char* usernameForREGISTER = NULL;
-char* passwordForREGISTER = NULL;
-unsigned interPacketGapMaxTime = 0;
+std::string usernameForREGISTER;
+std::string passwordForREGISTER;
+std::string singleStreamNameTemplate("proxyStream");
+std::string multipleStreamNameTemplate("proxyStream-%d");
+unsigned outPacketMaxSize = 2000000;  // bytes
+
+// Configuration for command-line streams
+std::string username;
+std::string password;
+portNumBits tunnelOverHTTPPortNum = 0;
+
+
+bool includeConfig(const char* path);
+bool loadINIFile(const char* inifile);
+
 
 static RTSPServer* createRTSPServer(Port port) {
   if (proxyREGISTERRequests) {
-    return RTSPServerWithREGISTERProxying::createNew(*env, port, authDB, authDBForREGISTER, 65, streamRTPOverTCP, verbosityLevel, username, password);
+    return RTSPServerWithREGISTERProxying::createNew(
+      *env, port, authDB, authDBForREGISTER, 65,
+      streamRTPOverTCP, verbosityLevel,
+      username.length() > 0 ? username.c_str() : NULL,
+      password.length() > 0 ? password.c_str() : NULL);
   } else {
     return RTSPServer::createNew(*env, port, authDB);
   }
@@ -47,39 +90,194 @@ static RTSPServer* createRTSPServer(Port port) {
 
 void usage() {
   *env << "Usage: " << progName
+       << " [-c <config-file>]"
        << " [-v|-V]"
        << " [-t|-T <http-port>]"
        << " [-p <rtspServer-port>]"
        << " [-u <username> <password>]"
        << " [-R] [-U <username-for-REGISTER> <password-for-REGISTER>]"
-       << " [-D <max-inter-packet-gap-time>]"
        << " <rtsp-url-1> ... <rtsp-url-n>\n";
   exit(1);
 }
 
-int main(int argc, char** argv) {
-  // Increase the maximum size of video frames that we can 'proxy' without truncation.
-  // (Such frames are unreasonably large; the back-end servers should really not be sending frames this large!)
-  OutPacketBuffer::maxSize = 2000000; // bytes
 
-  // Begin by setting up our usage environment:
-  TaskScheduler* scheduler = BasicTaskScheduler::createNew();
-  env = BasicUsageEnvironment::createNew(*scheduler);
+char* findConfigPath(int argc, char** argv) {
+  int pos = 1;
 
-  *env << "LIVE555 Proxy Server\n"
-       << "\t(LIVE555 Streaming Media library version "
-       << LIVEMEDIA_LIBRARY_VERSION_STRING
-       << "; licensed under the GNU LGPL)\n\n";
-
-  // Check command-line arguments: optional parameters, then one or more rtsp:// URLs (of streams to be proxied):
-  progName = argv[0];
-  if (argc < 2) usage();
-  while (argc > 1) {
-    // Process initial command-line options (beginning with "-"):
-    char* const opt = argv[1];
+  while (pos < argc) {
+    // Process initial command-line options (beginning with "-"),
+    // but find only path to configuration file
+    char* const opt = argv[pos];
     if (opt[0] != '-') break; // the remaining parameters are assumed to be "rtsp://" URLs
 
     switch (opt[1]) {
+    case 'c': { // path to configuration file
+      if (pos + 1 >= argc) {
+        usage();
+        return NULL;
+      }
+      return argv[pos + 1];
+    }
+
+    // Skip options that use few command-line arguments
+    case 'T': {
+      ++pos;
+      break;
+    }
+
+    case 'p': {
+      ++pos;
+      break;
+    }
+
+    case 'u': {
+      pos += 2;
+      break;
+    }
+
+    case 'U': {
+      pos += 2;
+      break;
+    }
+
+    // Skip any other options
+    default: {
+      break;
+    }
+    }
+
+    ++pos;
+  }
+
+  return NULL;
+}
+
+
+bool includeConfig(const char* path) {
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    *env << "Path \"" << path << "\" not found\n";
+    return false;
+  }
+
+  if (S_ISDIR(st.st_mode)) {
+    *env << "Config directories are not supported\n";
+    return false;
+  }
+
+  return loadINIFile(path);
+}
+
+
+bool loadINIFile(const char* inifile) {
+  INIReader reader(inifile);
+  if (reader.ParseError() != 0) {
+    return false;
+  }
+
+  // Global configuration variables
+  verbosityLevel = reader.GetInteger("general", "verbosity", verbosityLevel);
+  streamRTPOverTCP = reader.GetBoolean("general", "stream_rtp_over_tcp", streamRTPOverTCP);
+  tryStandardPortNumbers = reader.GetBoolean("general", "try_standard_port_numbers", tryStandardPortNumbers);
+  serverTunnelingOverHTTP = reader.GetBoolean("general", "server_tunneling_over_http", serverTunnelingOverHTTP);
+  serverTunnelingOverHTTPPortNum = reader.GetInteger("general", "server_tunneling_over_http_port", serverTunnelingOverHTTPPortNum);
+  rtspServerPortNum = reader.GetInteger("general", "rtsp_server_port", rtspServerPortNum);
+  proxyREGISTERRequests = reader.GetBoolean("general", "register_requests", proxyREGISTERRequests);
+  usernameForREGISTER = reader.Get("general", "username_for_register", usernameForREGISTER);
+  passwordForREGISTER = reader.Get("general", "password_for_register", passwordForREGISTER);
+  singleStreamNameTemplate = reader.Get("general", "single_stream_name", singleStreamNameTemplate);
+  // TODO: %d should be validated here
+  multipleStreamNameTemplate = reader.Get("general", "multiple_stream_name", multipleStreamNameTemplate);
+  int outPacketMaxSizeTmp = reader.GetInteger("general", "out_packet_max_size", 0);
+  if (outPacketMaxSizeTmp < 0) {
+    *env << "Invalid out_packet_max_size\n";
+    return false;
+  }
+  if (outPacketMaxSizeTmp > 0) {
+    outPacketMaxSize = outPacketMaxSizeTmp;
+  }
+
+  // Variables that affects only current streams
+  std::string streamUsername = reader.Get("streamparams", "username", "");
+  std::string streamPassword = reader.Get("streamparams", "password", "");
+  portNumBits streamTunnelOverHTTPPortNum =
+    (portNumBits) reader.GetInteger("streamparams", "tunnel_over_http_port", 0);
+
+  // Parse proxied streams from "streams" section
+  std::string urls = reader.Get("streams", "url[]", "");
+  std::string names = reader.Get("streams", "name[]", "");
+  std::stringstream ss1(urls);
+  std::stringstream ss2(names);
+  std::string url;
+  std::string streamName;
+
+  while (std::getline(ss1, url, '\n') && std::getline(ss2, streamName, '\n')) {
+    // Ensure that there are no collision with previous streams
+//    if (std::find(streamNames.begin(), streamNames.end(), streamName) != streamNames.end()) {
+//      *env << "Conflict: stream name " << streamName.c_str() << " is already used\n";
+//      return false;
+//    }
+
+    ProxyStream stream;
+    stream.proxiedURL = url;
+    stream.streamName = streamName;
+    stream.username = streamUsername;
+    stream.password = streamPassword;
+    stream.tunnelOverHTTPPortNum = streamTunnelOverHTTPPortNum;
+    streams.push_back(stream);
+    streamNames.push_back(streamName);
+  }
+
+  // Client access control to the RTSP server
+  std::string usernames = reader.Get("auth", "username", "");
+  std::string passwords = reader.Get("auth", "password", "");
+  std::stringstream ss3(usernames);
+  std::stringstream ss4(passwords);
+  std::string authUsername;
+  std::string authPassword;
+
+  while (std::getline(ss3, authUsername, '\n') && std::getline(ss4, authPassword, '\n')) {
+    if (authUsername.length() > 0 && authPassword.length() > 0) {
+      if (authDB == NULL) {
+        authDB = new UserAuthenticationDatabase;
+      }
+      authDB->addUserRecord(authUsername.c_str(), authPassword.c_str());
+    }
+  }
+
+  // Get list of config files for recursive loading
+  std::string includes = reader.Get("include", "path", "");
+
+  std::stringstream ss(includes);
+  std::string nextinifile;
+
+  // TODO: prevent infinite recursion
+  while(std::getline(ss, nextinifile, '\n')){
+    if (nextinifile.length() > 0) {
+      if (!includeConfig(nextinifile.c_str())) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+
+int parseArgs(int argc, char** argv) {
+  int pos = 1;
+
+  while (pos < argc) {
+    // Process initial command-line options (beginning with "-"):
+    char* const opt = argv[pos];
+    if (opt[0] != '-') break; // the remaining parameters are assumed to be "rtsp://" URLs
+
+    switch (opt[1]) {
+    case 'c': { // already parsed by findConfigPath function; just skip it
+      ++pos;
+      break;
+    }
+
     case 'v': { // verbose output
       verbosityLevel = 1;
       break;
@@ -99,27 +297,26 @@ int main(int argc, char** argv) {
 
     case 'T': {
       // stream RTP and RTCP over a HTTP connection
-      if (argc > 2 && argv[2][0] != '-') {
-	// The next argument is the HTTP server port number:                                                                       
-	if (sscanf(argv[2], "%hu", &tunnelOverHTTPPortNum) == 1
-	    && tunnelOverHTTPPortNum > 0) {
-	  ++argv; --argc;
-	  break;
-	}
+      if (pos + 1 < argc && argv[pos + 1][0] != '-') {
+        // The next argument is the HTTP server port number:
+        if (sscanf(argv[pos + 1], "%hu", &tunnelOverHTTPPortNum) == 1
+            && tunnelOverHTTPPortNum > 0) {
+          ++pos;
+          break;
+        }
       }
 
       // If we get here, the option was specified incorrectly:
-      usage();
-      break;
+      return -1;
     }
 
     case 'p': {
-      // specify a rtsp server port number 
-      if (argc > 2 && argv[2][0] != '-') {
+      // specify a rtsp server port number
+      if (pos + 1 < argc && argv[pos + 1][0] != '-') {
         // The next argument is the rtsp server port number:
-        if (sscanf(argv[2], "%hu", &rtspServerPortNum) == 1
+        if (sscanf(argv[pos + 1], "%hu", &rtspServerPortNum) == 1
             && rtspServerPortNum > 0) {
-          ++argv; --argc;
+          ++pos;
           break;
         }
       }
@@ -128,23 +325,23 @@ int main(int argc, char** argv) {
       usage();
       break;
     }
-    
+
     case 'u': { // specify a username and password (to be used if the 'back end' (i.e., proxied) stream requires authentication)
-      if (argc < 4) usage(); // there's no argv[3] (for the "password")
-      username = argv[2];
-      password = argv[3];
-      argv += 2; argc -= 2;
+      if (pos + 2 >= argc) return -1; // there's no argv[pos + 2] (for the "password")
+      username = std::string(argv[pos + 1]);
+      password = std::string(argv[pos + 2]);
+      pos += 2;
       break;
     }
 
     case 'U': { // specify a username and password to use to authenticate incoming "REGISTER" commands
-      if (argc < 4) usage(); // there's no argv[3] (for the "password")
-      usernameForREGISTER = argv[2];
-      passwordForREGISTER = argv[3];
+      if (pos + 2 >= argc) return -1; // there's no argv[pos + 2] (for the "password")
+      usernameForREGISTER = std::string(argv[pos + 1]);
+      passwordForREGISTER = std::string(argv[pos + 2]);
 
       if (authDBForREGISTER == NULL) authDBForREGISTER = new UserAuthenticationDatabase;
-      authDBForREGISTER->addUserRecord(usernameForREGISTER, passwordForREGISTER);
-      argv += 2; argc -= 2;
+      authDBForREGISTER->addUserRecord(usernameForREGISTER.c_str(), passwordForREGISTER.c_str());
+      pos += 2;
       break;
     }
 
@@ -153,69 +350,185 @@ int main(int argc, char** argv) {
       break;
     }
 
-    case 'D': { // specify maximum number of seconds to wait for packets:
-      if (argc > 2 && argv[2][0] != '-') {
-        if (sscanf(argv[2], "%u", &interPacketGapMaxTime) == 1) {
-          ++argv; --argc;
-          break;
-        }
-      }
-
-      // If we get here, the option was specified incorrectly:
-      usage();
-      break;
-    }
-
     default: {
-      usage();
-      break;
+      return -1;
     }
     }
 
-    ++argv; --argc;
+    ++pos;
   }
-  if (argc < 2 && !proxyREGISTERRequests) usage(); // there must be at least one "rtsp://" URL at the end 
+
+  return pos;
+}
+
+
+bool parseURLs(int argc, char** argv, int urlsStartPos) {
+  int i = 1;
+
+  while (urlsStartPos < argc) {
+    char streamName[127];
+    std::string cppStreamName(streamName);
+
+    // Ensure that there are no collisions with streams from config files
+    if (std::find(streamNames.begin(), streamNames.end(), cppStreamName) != streamNames.end()) {
+      *env << "Conflict: stream name " << streamName << " is already used\n";
+      continue;
+    }
+
+    ProxyStream stream;
+    stream.proxiedURL = std::string(argv[urlsStartPos]);
+    stream.streamName = cppStreamName;
+    stream.username = username;
+    stream.password = password;
+    stream.tunnelOverHTTPPortNum = tunnelOverHTTPPortNum;
+    streams.push_back(stream);
+    streamNames.push_back(cppStreamName);
+
+    ++urlsStartPos;
+    ++i;
+  }
+
+  return true;
+}
+void dummyTask(void) {
+
+    for(it = streams.begin(); it != streams.end(); ++it) {
+    for (auto itr = rtsp_streams.find((*it).streamName.c_str()); itr != rtsp_streams.end(); itr++)
+    {
+        if (rtsp_streams[((*it).streamName.c_str())] == (*it).proxiedURL.c_str())  //rtsp_url exists
+        {
+            dummy_rtsp_streams.erase((*it).streamName.c_str());
+            flag=true;
+            break;
+        }
+        else
+        {                                                                       //update
+            dummy_rtsp_streams.erase((*it).streamName.c_str());
+            rtsp_streams[((*it).streamName.c_str())] = (*it).proxiedURL.c_str();
+            rtspServer->deleteServerMediaSession(stream_map[(*it).streamName.c_str()]);
+            *env<< "Updated RTSP Stream url \n";
+            break;
+        }
+    }
+    if (flag==true)                     // RTSP URL already exist
+    {
+        flag=false;
+        continue;
+    }
+
+    // Adding ProxyServer Media Session
+    rtsp_streams[(*it).streamName.c_str()]=(*it).proxiedURL.c_str();
+    ServerMediaSession* sms
+      = ProxyServerMediaSession::createNew(*env, rtspServer,
+          (*it).proxiedURL.c_str(),
+          (*it).streamName.c_str(),
+          (*it).username.length() > 0 ? (*it).username.c_str() : NULL,
+          (*it).password.length() > 0 ? (*it).password.c_str() : NULL,
+          (*it).tunnelOverHTTPPortNum, verbosityLevel);
+    stream_map[(*it).streamName.c_str()]=sms;
+    rtspServer->addServerMediaSession(sms);
+
+    char* proxyStreamURL = rtspServer->rtspURL(sms);
+    *env << "RTSP stream, proxying the stream \"" << (*it).proxiedURL.c_str() << "\"\n";
+    *env << "\tPlay this stream using the URL: " << proxyStreamURL << "\n";
+    delete[] proxyStreamURL;
+  if (proxyREGISTERRequests) {
+    *env << "(We handle incoming \"REGISTER\" requests on port " << rtspServerPortNum << ")\n";
+  }
+  }
+
+  for (auto itr = dummy_rtsp_streams.begin(); itr != dummy_rtsp_streams.end(); itr++)
+  {
+      rtspServer->deleteServerMediaSession(stream_map[(itr)->first]);
+      dummy_rtsp_streams.erase((itr)->first);
+      *env<<"Deleted RTSP Stream \n";
+      rtsp_streams.erase((itr)->first);
+  }
+  dummy_rtsp_streams = rtsp_streams;
+  streams.clear();
+  includeConfig(inifile);
+   // Call this again, after a brief delay:
+   int uSecsToDelay = 1000000; // 1 s
+   env->taskScheduler().scheduleDelayedTask(uSecsToDelay,
+                                            (TaskFunc*)dummyTask, NULL);
+}
+
+int main(int argc, char** argv) {
+
+  // Begin by setting up our usage environment:
+  TaskScheduler* scheduler = BasicTaskScheduler::createNew();
+  env = BasicUsageEnvironment::createNew(*scheduler);
+  *env << "LIVE555 Proxy Server Ex\n"
+       << "\t(LIVE555 Streaming Media library version "
+       << LIVEMEDIA_LIBRARY_VERSION_STRING
+       << "; licensed under the GNU LGPL)\n\n";
+  // Check command-line arguments: optional parameters, then one or more rtsp:// URLs (of streams to be proxied):
+  progName = argv[0];
+  if (argc < 2) usage();
+  // Config file has low priority, so it should be loaded first
+  inifile = findConfigPath(argc, argv);
+  if (inifile != NULL) {
+    if (!includeConfig(inifile)) {
+      *env << "Cannot parse config files\n";
+      return 1;
+    }
+  }
+
+  // Command line parameters have high priority, parse it after config file
+  int urlsStartPos = parseArgs(argc, argv);
+  if (urlsStartPos < 1) {
+    usage();
+  }
+
+//   Parse URLs from command line arguments
+  if (!parseURLs(argc, argv, urlsStartPos)) {
+    return 1;
+  }
+
+  if (streams.size() < 1 && !proxyREGISTERRequests) {
+    usage();
+  }
+
   // Make sure that the remaining arguments appear to be "rtsp://" URLs:
-  int i;
-  for (i = 1; i < argc; ++i) {
-    if (strncmp(argv[i], "rtsp://", 7) != 0) usage();
+  for(it = streams.begin(); it != streams.end(); ++it) {
+    if ((*it).proxiedURL.find("rtsp://") != 0) {
+      *env << "Invalid URL " << (*it).proxiedURL.c_str() << "\n";
+      return 1;
+    }
+
+    if (streamRTPOverTCP) {
+      if ((*it).tunnelOverHTTPPortNum > 0) {
+        *env << "Invalid configuration for " << (*it).proxiedURL.c_str() << ": the -t and -T options cannot both be used!\n";
+        return 1;
+      } else {
+        (*it).tunnelOverHTTPPortNum = (portNumBits)(~0); // hack to tell "ProxyServerMediaSession" to stream over TCP, but not using HTTP
+      }
+    }
   }
+
   // Do some additional checking for invalid command-line argument combinations:
   if (authDBForREGISTER != NULL && !proxyREGISTERRequests) {
     *env << "The '-U <username> <password>' option can be used only with -R\n";
     usage();
   }
-  if (streamRTPOverTCP) {
-    if (tunnelOverHTTPPortNum > 0) {
-      *env << "The -t and -T options cannot both be used!\n";
-      usage();
-    } else {
-      tunnelOverHTTPPortNum = (portNumBits)(~0); // hack to tell "ProxyServerMediaSession" to stream over TCP, but not using HTTP
-    }
-  }
 
-#ifdef ACCESS_CONTROL
-  // To implement client access control to the RTSP server, do the following:
-  authDB = new UserAuthenticationDatabase;
-  authDB->addUserRecord("username1", "password1"); // replace these with real strings
-      // Repeat this line with each <username>, <password> that you wish to allow access to the server.
-#endif
+  // This option allows to increase the maximum size of video frames that we can 'proxy' without truncation.
+  // (Such frames are unreasonably large; the back-end servers should really not be sending frames this large!)
+  OutPacketBuffer::maxSize = outPacketMaxSize; // bytes
 
   // Create the RTSP server. Try first with the configured port number,
   // and then with the default port number (554) if different,
   // and then with the alternative port number (8554):
-  RTSPServer* rtspServer;
-  rtspServer = createRTSPServer(rtspServerPortNum);
-  if (rtspServer == NULL) {
-    if (rtspServerPortNum != 554) {
-      *env << "Unable to create a RTSP server with port number " << rtspServerPortNum << ": " << env->getResultMsg() << "\n";
-      *env << "Trying instead with the standard port numbers (554 and 8554)...\n";
 
-      rtspServerPortNum = 554;
-      rtspServer = createRTSPServer(rtspServerPortNum);
-    }
+  rtspServer = createRTSPServer(rtspServerPortNum);
+  if (rtspServer == NULL && tryStandardPortNumbers && rtspServerPortNum != 554) {
+    *env << "Unable to create a RTSP server with port number " << rtspServerPortNum << ": " << env->getResultMsg() << "\n";
+    *env << "Trying instead with the standard port numbers (554 and 8554)...\n";
+
+    rtspServerPortNum = 554;
+    rtspServer = createRTSPServer(rtspServerPortNum);
   }
-  if (rtspServer == NULL) {
+  if (rtspServer == NULL && tryStandardPortNumbers) {
     rtspServerPortNum = 8554;
     rtspServer = createRTSPServer(rtspServerPortNum);
   }
@@ -223,44 +536,28 @@ int main(int argc, char** argv) {
     *env << "Failed to create RTSP server: " << env->getResultMsg() << "\n";
     exit(1);
   }
-
-  // Create a proxy for each "rtsp://" URL specified on the command line:
-  for (i = 1; i < argc; ++i) {
-    char const* proxiedStreamURL = argv[i];
-    char streamName[30];
-    if (argc == 2) {
-      sprintf(streamName, "%s", "proxyStream"); // there's just one stream; give it this name
-    } else {
-      sprintf(streamName, "proxyStream-%d", i); // there's more than one stream; distinguish them by name
-    }
-    ServerMediaSession* sms
-      = ProxyServerMediaSession::createNew(*env, rtspServer,
-					   proxiedStreamURL, streamName,
-					   username, password, tunnelOverHTTPPortNum, verbosityLevel, -1, NULL, interPacketGapMaxTime);
-    rtspServer->addServerMediaSession(sms);
-
-    char* proxyStreamURL = rtspServer->rtspURL(sms);
-    *env << "RTSP stream, proxying the stream \"" << proxiedStreamURL << "\"\n";
-    *env << "\tPlay this stream using the URL: " << proxyStreamURL << "\n";
-    delete[] proxyStreamURL;
-  }
-
-  if (proxyREGISTERRequests) {
-    *env << "(We handle incoming \"REGISTER\" requests on port " << rtspServerPortNum << ")\n";
-  }
-
+   dummyTask();   // ScheduleDelayedTask
   // Also, attempt to create a HTTP server for RTSP-over-HTTP tunneling.
   // Try first with the default HTTP port (80), and then with the alternative HTTP
   // port numbers (8000 and 8080).
+  if (serverTunnelingOverHTTP) {
+    Boolean success;
+//    *env<<serverTunnelingOverHTTPPortNum<<"88888 \n";
+    if (serverTunnelingOverHTTPPortNum == 0) {
+      success = (rtspServer->setUpTunnelingOverHTTP(80) || rtspServer->setUpTunnelingOverHTTP(8000) || rtspServer->setUpTunnelingOverHTTP(8080));
+    } else {
+      success = rtspServer->setUpTunnelingOverHTTP(serverTunnelingOverHTTPPortNum);
+    }
 
-  if (rtspServer->setUpTunnelingOverHTTP(80) || rtspServer->setUpTunnelingOverHTTP(8000) || rtspServer->setUpTunnelingOverHTTP(8080)) {
-    *env << "\n(We use port " << rtspServer->httpServerPortNum() << " for optional RTSP-over-HTTP tunneling.)\n";
+    if (success) {
+      *env << "\n(We use port " << rtspServer->httpServerPortNum() << " for optional RTSP-over-HTTP tunneling.)\n";
+    } else {
+      *env << "\n(RTSP-over-HTTP tunneling is not available.)\n";
+    }
   } else {
-    *env << "\n(RTSP-over-HTTP tunneling is not available.)\n";
+    *env << "\n(RTSP-over-HTTP tunneling is disabled.)\n";
   }
-
-  // Now, enter the event loop:
-  env->taskScheduler().doEventLoop(); // does not return
+   env->taskScheduler().doEventLoop(); // does not return
 
   return 0; // only to prevent compiler warning
 }

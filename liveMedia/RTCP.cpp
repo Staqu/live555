@@ -117,7 +117,8 @@ static double dTimeNow() {
     return (double) (timeNow.tv_sec + timeNow.tv_usec/1000000.0);
 }
 
-static unsigned const maxRTCPPacketSize = 1456;
+//static unsigned const maxRTCPPacketSize = 1456;
+static unsigned const maxRTCPPacketSize = 3000;
 	// bytes (1500, minus some allowance for IP, UDP, UMTP headers)
 static unsigned const preferredRTCPPacketSize = 1000; // bytes
 
@@ -424,11 +425,12 @@ void RTCPInstance::incomingReportHandler(RTCPInstance* instance,
 
 void RTCPInstance::incomingReportHandler1() {
   do {
+    fNumBytesAlreadyRead=0;
     if (fNumBytesAlreadyRead >= maxRTCPPacketSize) {
       envir() << "RTCPInstance error: Hit limit when reading incoming packet over TCP. (fNumBytesAlreadyRead ("
 	      << fNumBytesAlreadyRead << ") >= maxRTCPPacketSize (" << maxRTCPPacketSize
 	      << ")).  The remote endpoint is using a buggy implementation of RTP/RTCP-over-TCP.  Please upgrade it!\n";
-      exit(1);
+//      exit(1);
     }
 
     unsigned numBytesRead;
