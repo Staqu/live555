@@ -415,6 +415,9 @@ void dummyTask(void) {
         flag=false;
         continue;
     }
+    if (streamRTPOverTCP) {
+        (*it).tunnelOverHTTPPortNum = (portNumBits)(~0); // hack to tell "ProxyServerMediaSession" to stream over TCP, but not using HTTP
+    }
 
     // Adding ProxyServer Media Session
     rtsp_streams[(*it).streamName.c_str()]=(*it).proxiedURL.c_str();
